@@ -1,0 +1,905 @@
+# -*- coding: utf-8 -*-
+import os
+import random
+import warnings
+warnings.filterwarnings('ignore')
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report
+from sklearn.preprocessing import StandardScaler
+
+
+# ---------------------------------------------------------------------
+# 0) 환경 설정 (재현성 & 성능)
+# ---------------------------------------------------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+set_seed(42)
+torch.set_float32_matmul_precision('high')
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+def augment_features(features, noise_std=0.01):
+    noise = torch.randn_like(features) * noise_std
+    return features + noise
+
+
+# ---------------------------------------------
+# 1) source_type 기반 시계열 그래프 데이터셋
+# ---------------------------------------------
+class SourceBasedSocialMediaGraphDataset(torch.utils.data.Dataset):
+    def __init__(self, past_df, future_df, time_windows=10,
+                 max_nodes=None, random_sample=True, pair_topk=5):
+        self.past_df = past_df.copy()
+        self.future_df = future_df.copy()
+        self.time_windows = time_windows
+        self.pair_topk = max(1, int(pair_topk))
+
+        if 'source_type' not in self.past_df.columns:
+            raise ValueError("source_type 컬럼이 없습니다.")
+        if 'video_id' not in self.past_df.columns:
+            raise ValueError("video_id 컬럼이 없습니다.")
+
+        unique_videos = self.past_df['video_id'].unique().tolist()
+
+        if max_nodes and len(unique_videos) > max_nodes:
+            if random_sample:
+                selected_videos = np.random.choice(unique_videos, max_nodes, replace=False)
+            else:
+                top_videos = self.past_df.groupby('video_id', as_index=False)['views'].max() \
+                                     .nlargest(max_nodes, 'views')['video_id'].tolist()
+                selected_videos = top_videos
+        else:
+            selected_videos = unique_videos
+
+        self.past_df = self.past_df[self.past_df['video_id'].isin(selected_videos)].reset_index(drop=True)
+        self.future_df = self.future_df.copy().reset_index(drop=True)
+
+        self.video_to_node = {vid: idx for idx, vid in enumerate(sorted(set(self.past_df['video_id'])))}
+        self.node_to_video = {idx: vid for vid, idx in self.video_to_node.items()}
+        self.num_nodes = len(self.video_to_node)
+
+        print(f"선택된 노드 수: {self.num_nodes}")
+        print(f"랜덤 샘플링: {random_sample}")
+        print("source_type 분포:")
+        print(self.past_df['source_type'].value_counts().head(10))
+
+        self.st_list = sorted(self.past_df['source_type'].unique().tolist())
+        self.st_to_idx = {st: i for i, st in enumerate(self.st_list)}
+        self.num_st = len(self.st_list)
+
+        self.create_meaningful_temporal_graph()
+
+    def _safe_ratio(self, a, b):
+        a = float(a); b = float(b)
+        return (a - b) / (max(a, b) + 1.0)
+
+    def _label_from_future(self, dst_row):
+        dst_vid = dst_row['video_id']
+        future_data = self.future_df[self.future_df['video_id'] == dst_vid]
+        if len(future_data) == 0:
+            return 0
+
+        past_views = float(dst_row['views'])
+        future_views = float(future_data.iloc[0]['views'])
+        view_increase = future_views - past_views
+
+        if 'original_date' in dst_row and pd.notnull(dst_row['original_date']):
+            try:
+                first_date = pd.to_datetime(dst_row['original_date'])
+            except Exception:
+                first_date = pd.to_datetime('2025-05-10')
+        else:
+            if 'timestamp' in dst_row and pd.notnull(dst_row['timestamp']):
+                try:
+                    first_date = pd.to_datetime(dst_row['timestamp'])
+                except Exception:
+                    first_date = pd.to_datetime('2025-05-10')
+            else:
+                first_date = pd.to_datetime('2025-05-10')
+
+        d = first_date
+        if pd.to_datetime('2025-05-10') <= d < pd.to_datetime('2025-05-18'):
+            return 1 if view_increase >= 100000 else 0
+        elif pd.to_datetime('2025-05-18') <= d < pd.to_datetime('2025-05-25'):
+            return 1 if view_increase >= 80000 else 0
+        elif pd.to_datetime('2025-05-25') <= d < pd.to_datetime('2025-06-01'):
+            return 1 if view_increase >= 60000 else 0
+        elif pd.to_datetime('2025-06-01') <= d < pd.to_datetime('2025-06-08'):
+            return 1 if view_increase >= 50000 else 0
+        elif pd.to_datetime('2025-06-08') <= d < pd.to_datetime('2025-06-15'):
+            return 1 if view_increase >= 40000 else 0
+        elif pd.to_datetime('2025-06-15') <= d < pd.to_datetime('2025-06-22'):
+            return 1 if view_increase >= 30000 else 0
+        elif pd.to_datetime('2025-06-22') <= d < pd.to_datetime('2025-06-30'):
+            return 1 if view_increase >= 20000 else 0
+        else:
+            return 0
+
+    def create_meaningful_temporal_graph(self):
+        print("source_type 기반 의미 있는 시계열 그래프 데이터 생성 중...")
+        timestamps = self.past_df['timestamp'].values if 'timestamp' in self.past_df.columns else np.arange(len(self.past_df))
+        timestamps = np.nan_to_num(timestamps, nan=0.0)
+        print(f"Timestamp 범위: {timestamps.min()} ~ {timestamps.max()}")
+        time_bins = np.linspace(timestamps.min(), timestamps.max(), self.time_windows + 1)
+
+        self.src_nodes, self.dst_nodes = [], []
+        self.edge_features, self.timestamps, self.labels = [], [], []
+        self.source_types = []
+
+        for i in range(self.time_windows):
+            start_time, end_time = time_bins[i], time_bins[i + 1]
+            mask = (timestamps >= start_time) & (timestamps < end_time)
+            window_data = self.past_df[mask]
+            if len(window_data) == 0:
+                continue
+
+            for source_type, group in window_data.groupby('source_type'):
+                if len(group) < 2:
+                    continue
+
+                g_sorted = group.sort_values('views', ascending=False).reset_index(drop=True)
+                top_idx = list(range(min(self.pair_topk, len(g_sorted))))
+                bot_idx = list(range(max(0, len(g_sorted) - self.pair_topk), len(g_sorted)))
+                cand_idx = sorted(set(top_idx + bot_idx))
+                if len(cand_idx) < 2:
+                    continue
+
+                sub = g_sorted.loc[cand_idx].reset_index(drop=True)
+
+                for j in range(len(sub)):
+                    for k in range(len(sub)):
+                        if j == k:
+                            continue
+                        src_vid = sub.iloc[j]['video_id']
+                        dst_vid = sub.iloc[k]['video_id']
+                        if src_vid not in self.video_to_node or dst_vid not in self.video_to_node:
+                            continue
+                        src_node = self.video_to_node[src_vid]
+                        dst_node = self.video_to_node[dst_vid]
+
+                        src_data = sub.iloc[j]
+                        dst_data = sub.iloc[k]
+
+                        views_diff    = self._safe_ratio(src_data['views'],    dst_data['views'])
+                        likes_diff    = self._safe_ratio(src_data['likes'],    dst_data['likes'])
+                        comments_diff = self._safe_ratio(src_data['comments'], dst_data['comments'])
+                        t_norm = i / max(self.time_windows - 1, 1)
+
+                        st_idx = self.st_to_idx[source_type]
+                        st_onehot = np.zeros(self.num_st, dtype=np.float32)
+                        st_onehot[st_idx] = 1.0
+
+                        edge_feat = [views_diff, likes_diff, comments_diff, t_norm] + st_onehot.tolist()
+
+                        self.src_nodes.append(self.video_to_node[src_vid])
+                        self.dst_nodes.append(self.video_to_node[dst_vid])
+                        self.edge_features.append(edge_feat)
+                        self.timestamps.append(float(i))
+                        self.source_types.append(source_type)
+
+                        viral_label = self._label_from_future(dst_data)
+                        self.labels.append(viral_label)
+
+        self.src_nodes = np.array(self.src_nodes, dtype=np.int64)
+        self.dst_nodes = np.array(self.dst_nodes, dtype=np.int64)
+        self.edge_features = np.array(self.edge_features, dtype=np.float32)
+        self.timestamps = np.array(self.timestamps, dtype=np.float32)
+        self.labels = np.array(self.labels, dtype=np.int64)
+
+        print(f"생성된 그래프: {len(self.src_nodes)}개 엣지, {self.num_nodes}개 노드")
+        print(f"바이럴 라벨 분포: {np.sum(self.labels)}/{len(self.labels)} ({np.mean(self.labels)*100:.1f}%)")
+        source_type_counts = pd.Series(self.source_types).value_counts()
+        print("\nsource_type별 엣지 분포 (상위 10개):")
+        print(source_type_counts.head(10))
+        if len(self.src_nodes) == 0:
+            raise ValueError("엣지가 생성되지 않았습니다.")
+
+    def __len__(self):
+        return len(self.src_nodes)
+
+    def __getitem__(self, idx):
+        return (
+            self.src_nodes[idx],
+            self.dst_nodes[idx],
+            self.edge_features[idx],
+            self.timestamps[idx],
+            self.labels[idx]
+        )
+
+
+# ------------------------------------------------
+# 2) 시점별 인접행렬(스냅샷) 생성 (EvolveGCN용)
+# ------------------------------------------------
+def normalize_sparse_adj(i_idx, v_vals, num_nodes, add_self_loops=True):
+    adj = torch.sparse_coo_tensor(i_idx, v_vals, (num_nodes, num_nodes)).coalesce()
+    if add_self_loops:
+        diag_idx = torch.arange(num_nodes, dtype=torch.long)
+        di = torch.stack([diag_idx, diag_idx])
+        dv = torch.ones(num_nodes, dtype=torch.float32, device=v_vals.device)
+        eye = torch.sparse_coo_tensor(di, dv, (num_nodes, num_nodes)).coalesce()
+        adj = (adj + eye).coalesce()
+
+    row_sums = torch.sparse.sum(adj, dim=1).to_dense().clamp_min(1e-6)
+    vals = adj.values() / row_sums[adj.indices()[0]]
+    adj = torch.sparse_coo_tensor(adj.indices(), vals, adj.size()).coalesce()
+    return adj
+
+
+def build_timewise_adjs(dataset, num_nodes, device='cpu'):
+    times = dataset.timestamps.astype(int)
+    T = int(times.max()) + 1
+    adjs = []
+    for t in range(T):
+        mask = (times == t)
+        if mask.sum() == 0:
+            idx = torch.arange(num_nodes, dtype=torch.long)
+            i_idx = torch.stack([idx, idx])
+            v_vals = torch.ones(num_nodes, dtype=torch.float32)
+            adjs.append(torch.sparse_coo_tensor(i_idx, v_vals, (num_nodes, num_nodes)).coalesce().to(device))
+            continue
+
+        s = dataset.src_nodes[mask]
+        d = dataset.dst_nodes[mask]
+        rows = np.concatenate([s, d])
+        cols = np.concatenate([d, s])
+        vals = np.ones_like(rows, dtype=np.float32)
+
+        i_idx = torch.tensor([rows, cols], dtype=torch.long)
+        v_vals = torch.tensor(vals, dtype=torch.float32)
+        adj = normalize_sparse_adj(i_idx, v_vals, num_nodes, add_self_loops=True).to(device)
+        adjs.append(adj)
+    return adjs  # list of length T
+
+
+# ------------------------------------------------
+# 3) EvolveGCN (H-스타일 근사)
+# ------------------------------------------------
+class EvolveGCNHLayer(nn.Module):
+    def __init__(self, in_dim, out_dim, state_dim=128, dropout=0.5, summary='mean'):
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.state_dim = state_dim
+        self.summary = summary
+
+        self.gru = nn.GRUCell(in_dim, state_dim)
+        self.state = nn.Parameter(torch.randn(state_dim) * 0.1)
+        self.weight_gen = nn.Linear(state_dim, in_dim * out_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(out_dim)
+
+    def summarize(self, H):
+        return H.mean(dim=0)
+
+    def forward(self, H_prev, adj):
+        z_t = self.summarize(H_prev)
+        S_prev = self.state.unsqueeze(0)
+        S_t = self.gru(z_t.unsqueeze(0), S_prev)
+        W_flat = self.weight_gen(S_t.squeeze(0))
+        W_t = W_flat.view(self.in_dim, self.out_dim)
+
+        # [BF16 오류 방지] sparse.mm은 .float() 강제
+        if adj.is_sparse:
+             with torch.cuda.amp.autocast(enabled=False):
+                support = torch.sparse.mm(adj.float(), H_prev.float())
+        else:
+            support = torch.mm(adj, H_prev.float())
+            
+        H_t = support @ W_t
+        H_t = F.relu(H_t)
+        H_t = self.norm(H_t)
+        H_t = self.dropout(H_t)
+        return H_t, S_t.squeeze(0)
+
+
+class EvolveGCNOnly(nn.Module):
+    def __init__(self, node_feat_dim=10, hidden_dim=64, out_dim=64, state_dim=128, dropout=0.5):
+        super().__init__()
+        self.x_proj = nn.Linear(node_feat_dim, hidden_dim)
+        self.evolve = EvolveGCNHLayer(hidden_dim, out_dim, state_dim=state_dim, dropout=dropout)
+        self.edge_pred = nn.Sequential(
+            nn.Linear(2*out_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(16, 1)
+        )
+        self.register_buffer("state_cache", torch.zeros(state_dim))
+
+    def reset_sequence(self):
+        with torch.no_grad():
+            self.state_cache.copy_(self.evolve.state.detach())
+
+    def step(self, H_prev, adj):
+        H_t, S_t = self.evolve(H_prev, adj)
+        with torch.no_grad():
+            self.state_cache.copy_(S_t)
+        return H_t
+
+    def forward_edge_logits(self, H_t, src_idx, dst_idx):
+        src_h = H_t[src_idx]
+        dst_h = H_t[dst_idx]
+        z = torch.cat([src_h, dst_h], dim=-1)
+        return self.edge_pred(z).squeeze(-1)
+
+
+# ---------------------------------
+# 4) 데이터 로딩 및 전처리
+# ---------------------------------
+def source_based_load_and_prepare_data(past_file, future_file):
+    print("source_type 기반 데이터 로딩 중...")
+    past_df = pd.read_csv(past_file, encoding='utf-8-sig')
+    future_df = pd.read_csv(future_file, encoding='utf-8-sig')
+
+    past_df.columns = [col.strip() for col in past_df.columns]
+    future_df.columns = [col.strip() for col in future_df.columns]
+
+    if 'source_type' not in past_df.columns:
+        raise ValueError("past_df에 source_type 컬럼이 없습니다.")
+    if 'video_id' not in past_df.columns:
+        raise ValueError("past_df에 video_id 컬럼이 없습니다.")
+
+    for col in ['views', 'likes', 'comments']:
+        if col in past_df.columns:
+            past_df[col] = pd.to_numeric(past_df[col], errors='coerce').fillna(0)
+        if col in future_df.columns:
+            future_df[col] = pd.to_numeric(future_df[col], errors='coerce').fillna(0)
+
+    if 'timestamp' not in past_df.columns:
+        past_df['timestamp'] = np.arange(len(past_df))
+        past_df['original_date'] = pd.to_datetime('2025-05-10') + pd.to_timedelta(past_df['timestamp'], unit='D')
+    else:
+        past_df['original_date'] = pd.to_datetime(past_df['timestamp'], errors='coerce')
+        past_df['timestamp'] = (past_df['original_date'] - past_df['original_date'].min()).dt.days
+        if isinstance(past_df['timestamp'], pd.Series):
+            past_df['timestamp'] = past_df['timestamp'].fillna(0)
+
+    print(f"과거 데이터: {len(past_df)}개 영상")
+    print(f"미래 데이터: {len(future_df)}개 영상")
+    print(f"source_type 종류: {past_df['source_type'].nunique()}개")
+    return past_df, future_df
+
+
+# ------------------------------------------------------------
+# 5) 엣지 개수 기준 70/15/15 분할
+# ------------------------------------------------------------
+def build_edges_by_time(dataset):
+    """각 시점 t별 엣지 인덱스 리스트 반환"""
+    times = dataset.timestamps.astype(int)
+    T = int(times.max()) + 1
+    per_t = []
+    for t in range(T):
+        idx = np.where(times == t)[0]
+        per_t.append(idx)
+    return per_t, T
+
+def split_edges_exact_ratio(dataset, target=(0.7, 0.15, 0.15)):
+    """
+    엣지 개수 누적 기준으로 정확히 70/15/15로 분할.
+    - 시간 순서 보존
+    - train -> val -> test 로 순차 할당
+    - 경계 시점(bin) 내부에서도 부분 할당(앞쪽부터)하여 정확한 비율 맞춤
+    """
+    per_t, T = build_edges_by_time(dataset)
+    counts = np.array([len(x) for x in per_t], dtype=np.int64)
+    total = int(counts.sum())
+    if total == 0:
+        raise ValueError("엣지가 없습니다.")
+
+    train_target = int(round(total * target[0]))
+    val_target   = int(round(total * target[1]))
+    # 잔여를 test에 할당하여 총합 보정
+    test_target  = total - train_target - val_target
+
+    train_by_t = [np.array([], dtype=np.int64) for _ in range(T)]
+    val_by_t   = [np.array([], dtype=np.int64) for _ in range(T)]
+    test_by_t  = [np.array([], dtype=np.int64) for _ in range(T)]
+
+    tr_left, va_left, te_left = train_target, val_target, test_target
+
+    # 시점 순회하며 앞에서부터 채움
+    for t in range(T):
+        idx = per_t[t]
+        if len(idx) == 0:
+            continue
+        ptr = 0
+
+        # train 채우기
+        if tr_left > 0:
+            take = min(tr_left, len(idx) - ptr)
+            if take > 0:
+                train_by_t[t] = idx[ptr:ptr+take]
+                ptr += take
+                tr_left -= take
+
+        # val 채우기
+        if ptr < len(idx) and va_left > 0:
+            take = min(va_left, len(idx) - ptr)
+            if take > 0:
+                val_by_t[t] = idx[ptr:ptr+take]
+                ptr += take
+                va_left -= take
+
+        # test 나머지
+        if ptr < len(idx) and te_left > 0:
+            take = min(te_left, len(idx) - ptr)
+            if take > 0:
+                test_by_t[t] = idx[ptr:ptr+take]
+                ptr += take
+                te_left -= take
+
+        # 남는게 있다면(이론상 없게 설계했지만 수치 반올림 차이를 대비)
+        if ptr < len(idx):
+            # 잔여를 test에 흡수
+            extra = idx[ptr:]
+            test_by_t[t] = np.concatenate([test_by_t[t], extra])
+            te_left -= len(extra)
+
+    # 시간 구간(워밍업 경계)을 위해 최초 시점 계산
+    def first_nonempty_time(lists):
+        for t in range(T):
+            if len(lists[t]) > 0:
+                return t
+        return None
+
+    train_times = list(range(0, (first_nonempty_time(val_by_t) if first_nonempty_time(val_by_t) is not None else T)))
+    val_times   = list(range(first_nonempty_time(val_by_t) if first_nonempty_time(val_by_t) is not None else T,
+                             (first_nonempty_time(test_by_t) if first_nonempty_time(test_by_t) is not None else T)))
+    test_times  = list(range(first_nonempty_time(test_by_t) if first_nonempty_time(test_by_t) is not None else T, T))
+
+    # 디버깅 출력 (수정: 원본 '분할 결과' 스타일로 변경)
+    trN = sum(len(x) for x in train_by_t)
+    vaN = sum(len(x) for x in val_by_t)
+    teN = sum(len(x) for x in test_by_t)
+    # print(f"[edge split] total={total} -> train={trN} ({trN/total:.3%})  val={vaN} ({vaN/total:.3%})  test={teN} ({teN/total:.3%})")
+    # print(f"[edge split] train_times={train_times}  val_times={val_times}  test_times={test_times}")
+    print(f"분할 결과: Train={trN}, Val={vaN}, Test={teN}")
+
+
+    return (train_by_t, val_by_t, test_by_t), (train_times, val_times, test_times), T
+
+
+# ------------------------------------------------------------
+# 6) 학습/평가 루프 (엣지 기준 split 사용)
+# ------------------------------------------------------------
+def train_eval_evolvegcn(dataset, node_features, device='cpu',
+                         epochs=100, lr=5e-4, train_noise_std=0.02, patience=15,
+                         out_best_path='chat2_evolvegcn_only_best.pth'):
+    print("EvolveGCN-only 모델 학습 시작...")
+
+    num_nodes = dataset.num_nodes
+
+    # 엣지 기준 70/15/15 분할
+    (train_edges_by_t, val_edges_by_t, test_edges_by_t), (train_times, val_times, test_times), T = split_edges_exact_ratio(
+        dataset, target=(0.7, 0.15, 0.15)
+    )
+
+    # 스냅샷 adj
+    adjs = build_timewise_adjs(dataset, num_nodes, device=device)
+
+    # pos_weight (Train 엣지에 대해서만)
+    train_all_idx = np.concatenate([x for x in train_edges_by_t if len(x) > 0], axis=0) if any(len(x)>0 for x in train_edges_by_t) \
+                     else np.array([], dtype=np.int64)
+    train_labels_for_weight = dataset.labels[train_all_idx] if train_all_idx.size > 0 else np.array([0,1])
+    num_pos = float(train_labels_for_weight.sum())
+    num_neg = float(len(train_labels_for_weight) - num_pos)
+    ratio = num_neg / max(num_pos, 1.0)
+    ratio = max(1.0, min(ratio, 20.0))
+    print(f"[info] pos_weight(ratio) = {ratio:.3f}")
+    pos_weight = torch.tensor([ratio], device=device)
+
+    node_feat_dim = node_features.shape[1]
+    model = EvolveGCNOnly(node_feat_dim=node_feat_dim, hidden_dim=64, out_dim=64, state_dim=128, dropout=0.5).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=2e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.7)
+
+    best_val_auc = 0.0
+    best_state = None
+    no_improve = 0
+
+    X_cpu = node_features.clone()
+    for epoch in range(epochs):
+        # ---------------- Train ----------------
+        model.train()
+        model.reset_sequence()
+        total_loss = 0.0
+
+        X_train = X_cpu.to(device)
+        X_train = augment_features(X_train, noise_std=train_noise_std)
+        H_prev = model.x_proj(X_train)
+
+        # 시간 순회(학습 구간: train_times; 그 시점의 train-edges만 사용)
+        for t in train_times:
+            # [BF16 오류 방지] autocast 내부에서 sparse.mm 호출 방지
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=False):
+                 H_t = model.step(H_prev.float(), adjs[t].float())
+
+            edge_idx = train_edges_by_t[t]
+            if len(edge_idx) > 0:
+                src = torch.tensor(dataset.src_nodes[edge_idx], dtype=torch.long, device=device)
+                dst = torch.tensor(dataset.dst_nodes[edge_idx], dtype=torch.long, device=device)
+                labels = torch.tensor(dataset.labels[edge_idx], dtype=torch.float32, device=device)
+
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device == 'cuda')):
+                    logits = model.forward_edge_logits(H_t, src, dst)
+                    logits = torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
+                    bce_loss = criterion(logits, labels)
+
+                    # 보조 pairwise 손실
+                    pos_idx = (labels > 0.5).nonzero(as_tuple=False).squeeze(-1)
+                    neg_idx = (labels < 0.5).nonzero(as_tuple=False).squeeze(-1)
+                    pair_loss = torch.tensor(0.0, device=logits.device)
+                    if pos_idx.numel() > 0 and neg_idx.numel() > 0:
+                        k = min(256, pos_idx.numel(), neg_idx.numel())
+                        p = pos_idx[torch.randint(pos_idx.numel(), (k,), device=logits.device)]
+                        n = neg_idx[torch.randint(neg_idx.numel(), (k,), device=logits.device)]
+                        pair_loss = F.softplus(-(logits[p] - logits[n])).mean()
+
+                    loss = bce_loss + 0.2 * pair_loss
+                
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += float(loss.item())
+
+            # 그래프 끊기 (두 번째 backward 오류 방지)
+            H_prev = H_t.detach()
+
+        # ---------------- Validation ----------------
+        model.eval()
+        with torch.no_grad():
+            model.reset_sequence()
+            X_eval = X_cpu.to(device)
+            H_prev = model.x_proj(X_eval)
+
+            # 워밍업: train_times 전체만 통과 (val/test 시점 adj는 사용하지 않음)
+            for t in train_times:
+                # [BF16 오류 방지]
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=False):
+                    H_prev = model.step(H_prev.float(), adjs[t].float())
+
+            val_probs, val_labels = [], []
+            for t in val_times:
+                # [BF16 오류 방지]
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=False):
+                    H_t = model.step(H_prev.float(), adjs[t].float())
+                
+                edge_idx = val_edges_by_t[t]
+                if len(edge_idx) > 0:
+                    src = torch.tensor(dataset.src_nodes[edge_idx], dtype=torch.long, device=device)
+                    dst = torch.tensor(dataset.dst_nodes[edge_idx], dtype=torch.long, device=device)
+                    labels = torch.tensor(dataset.labels[edge_idx], dtype=torch.float32, device=device)
+                    
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device == 'cuda')):
+                        logits = model.forward_edge_logits(H_t, src, dst)
+                        probs = torch.sigmoid(torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0))
+                    
+                    val_probs.append(probs.cpu().float().numpy())
+                    val_labels.append(labels.cpu().numpy())
+                H_prev = H_t
+
+            if len(val_probs) > 0:
+                val_probs = np.concatenate(val_probs)
+                val_labels = np.concatenate(val_labels)
+                val_probs = np.nan_to_num(val_probs, nan=0.5, posinf=1.0, neginf=0.0)
+
+                val_bin = (val_probs > 0.5).astype(int)
+                
+                # [수정] 원본 스타일 '진단' 출력문 추가
+                if val_labels.size > 0:
+                    val_labels_int = val_labels.astype(int)
+                    # np.bincount는 음수 인덱스를 허용하지 않으므로, 혹시 모를 오류 방지
+                    if (val_labels_int >= 0).all():
+                         print(f"[진단] Val label 분포: {np.bincount(val_labels_int)}")
+                    if (val_bin >= 0).all():
+                         print(f"[진단] Val 예측 분포: {np.bincount(val_bin)}")
+                    print(f"[진단] Val 예측 확률 평균: {np.mean(val_probs):.4f}")
+                
+                try:
+                    val_auc = roc_auc_score(val_labels, val_probs) if np.unique(val_labels).size > 1 else 0.5
+                except Exception:
+                    val_auc = 0.5
+                val_acc = accuracy_score(val_labels, val_bin)
+                val_prec = precision_score(val_labels, val_bin, zero_division=0)
+                val_rec = recall_score(val_labels, val_bin, zero_division=0)
+                val_f1 = f1_score(val_labels, val_bin, zero_division=0)
+            else:
+                val_auc = 0.5; val_acc = val_prec = val_rec = val_f1 = 0.0
+
+        scheduler.step(val_auc)
+        # [수정] 원본 스타일 Epoch 출력문
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {total_loss:.4f} | "
+              f"Val AUC: {val_auc:.4f} | Val Acc: {val_acc:.4f} | "
+              f"Val Prec: {val_prec:.4f} | Val Recall: {val_rec:.4f} | Val F1: {val_f1:.4f}")
+
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            best_state = model.state_dict()
+            no_improve = 0
+            torch.save(model.state_dict(), out_best_path)
+        else:
+            no_improve += 1
+            # [수정] 원본 스타일 조기 종료
+            if no_improve >= patience:
+                print(f"▶ Early stopping triggered. (No improvement for {patience} epochs)")
+                break
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    print(f"최고 검증 AUC: {best_val_auc:.4f}")
+
+    # 학습 산출물 반환
+    return model, adjs, (train_edges_by_t, val_edges_by_t, test_edges_by_t), (train_times, val_times, test_times)
+
+
+# -------------------------------------------------
+# 7) 평가 및 CSV 저장 (엣지 리스트 직접 사용)
+# -------------------------------------------------
+def evaluate_and_save_edges(model, adjs, edges_by_t, times_span, dataset, node_features, device='cpu',
+                            out_csv='chat2_evolvegcn_only_results.csv', batch_name='EVAL'):
+    """
+    edges_by_t: 리스트 길이 T, 각 원소는 해당 시점의 대상 엣지 인덱스(np.array)
+    times_span: 이 평가에서 순회할 시점 리스트 (예: val_times 또는 test_times)
+    warm-up은 호출부에서 train_times로 먼저 수행해야 함
+    """
+    # [수정] 원본 스타일 출력
+    print(f"Source-based 예측 결과 평가 중 ({out_csv})...")
+    
+    model.eval()
+    with torch.no_grad():
+        X = node_features.to(device)
+        H_prev = model.x_proj(X)
+
+        all_probs, all_labels, all_src, all_dst = [], [], [], []
+        for t in times_span:
+             # [BF16 오류 방지]
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=False):
+                H_t = model.step(H_prev.float(), adjs[t].float())
+            
+            edge_idx = edges_by_t[t]
+            if len(edge_idx) > 0:
+                src = torch.tensor(dataset.src_nodes[edge_idx], dtype=torch.long, device=device)
+                dst = torch.tensor(dataset.dst_nodes[edge_idx], dtype=torch.long, device=device)
+                labels = torch.tensor(dataset.labels[edge_idx], dtype=torch.float32, device=device)
+                
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device == 'cuda')):
+                    logits = model.forward_edge_logits(H_t, src, dst)
+                    probs = torch.sigmoid(torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0))
+
+                all_probs.append(probs.cpu().float().numpy())
+                all_labels.append(labels.cpu().numpy())
+                all_src.append(src.cpu().numpy())
+                all_dst.append(dst.cpu().numpy())
+            H_prev = H_t
+
+        if len(all_probs) == 0:
+            print(f"{batch_name}: 평가용 샘플 없음")
+            return pd.DataFrame()
+
+        all_probs = np.concatenate(all_probs)
+        all_labels = np.concatenate(all_labels)
+        all_src = np.concatenate(all_src)
+        all_dst = np.concatenate(all_dst)
+        all_labels = all_labels.astype(int)
+
+        y_pred = (all_probs > 0.5).astype(int)
+        acc  = accuracy_score(all_labels, y_pred)
+        prec = precision_score(all_labels, y_pred, zero_division=0)
+        rec  = recall_score(all_labels, y_pred, zero_division=0)
+        f1   = f1_score(all_labels, y_pred, zero_division=0)
+        auc  = roc_auc_score(all_labels, all_probs) if np.unique(all_labels).size > 1 else None
+
+        # [수정] 원본 스타일 상세 지표 출력
+        print(f"\n=== {batch_name} 모델 성능 ({out_csv}) ===")
+        print(f"정확도: {acc:.4f}")
+        print(f"정밀도: {prec:.4f}")
+        print(f"재현율: {rec:.4f}")
+        print(f"F1-score: {f1:.4f}")
+        print("AUC: NA (single class)" if auc is None else f"AUC: {auc:.4f}")
+        
+        print("\n=== 상세 분류 보고서 ===")
+        print(classification_report(all_labels, y_pred, zero_division=0))
+
+        results_df = pd.DataFrame({
+            'src_node_id': all_src.astype(int),
+            'dst_node_id': all_dst.astype(int),
+            'src_video_id': [dataset.node_to_video[int(s)] for s in all_src],
+            'dst_video_id': [dataset.node_to_video[int(d)] for d in all_dst],
+            'prediction_probability': all_probs,
+            'actual_viral': all_labels.astype(int),
+            'predicted_viral': y_pred.astype(int)
+        })
+        
+        # (구조 유지: source_type은 'Unknown'으로 고정)
+        results_df['src_source_type'] = 'Unknown'
+        results_df['dst_source_type'] = 'Unknown'
+        
+        results_df.to_csv(out_csv, index=False, encoding='utf-8-sig')
+        # [수정] 원본 스타일 저장 완료
+        print(f"\n결과가 '{out_csv}'에 저장되었습니다.")
+        return results_df
+
+
+# -----------------------------
+# 8) main
+# -----------------------------
+def main():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"사용 디바이스: {device}")
+    try:
+        # 1) 데이터 로딩
+        past_df, future_df = source_based_load_and_prepare_data(
+            'filter(5.10~6.30).csv',
+            'filter(7.3).csv'
+        )
+
+        # 2) 설정
+        max_nodes = 2000
+        time_windows = 5
+        epochs = 100
+        lr = 0.0005
+        pair_topk = 35
+        patience = 15
+
+        print(f"시간 윈도우: {time_windows} | 에폭: {epochs} | lr: {lr}")
+
+        # 3) 데이터셋 생성
+        dataset = SourceBasedSocialMediaGraphDataset(
+            past_df=past_df,
+            future_df=future_df,
+            time_windows=time_windows,
+            max_nodes=max_nodes,
+            random_sample=True,
+            pair_topk=pair_topk
+        )
+
+        # 4) 노드 특성
+        node_feature_cols = ['views', 'likes', 'comments']
+        node_features = []
+        for idx in range(dataset.num_nodes):
+            vid = dataset.node_to_video[idx]
+            row = past_df[past_df['video_id'] == vid]
+            if len(row) > 0:
+                vals = [row.iloc[0][c] if c in row.columns and pd.notnull(row.iloc[0][c]) else 0 for c in node_feature_cols]
+                node_features.append(vals)
+            else:
+                node_features.append([0]*len(node_feature_cols))
+        node_features = np.array(node_features, dtype=np.float32)
+        scaler = StandardScaler()
+        node_features = scaler.fit_transform(node_features)
+        node_features = torch.tensor(node_features, dtype=torch.float32)
+        if node_features.shape[1] < 10:
+            pad = torch.zeros((node_features.shape[0], 10 - node_features.shape[1]), dtype=torch.float32)
+            node_features = torch.cat([node_features, pad], dim=1)
+
+        print(f"노드 특성 차원: {node_features.shape}")
+
+        # 5) 학습 (엣지 기준 70/15/15)
+        model, adjs, (train_edges_by_t, val_edges_by_t, test_edges_by_t), (train_times, val_times, test_times) = train_eval_evolvegcn(
+            dataset=dataset,
+            node_features=node_features,
+            device=device,
+            epochs=epochs,
+            lr=lr,
+            patience=patience,
+            out_best_path='evolvegcn_only_best.pth'
+        )
+
+        # 6) Val/Test 평가 (warm-up = train_times)
+
+        # Validation
+        # 먼저 train_times로 수동 워밍업
+        with torch.no_grad():
+            model.reset_sequence()
+            X_eval = node_features.to(device)
+            H_prev = model.x_proj(X_eval)
+            for t in train_times:
+                # [BF16 오류 방지]
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=False):
+                    H_prev = model.step(H_prev.float(), adjs[t].float())
+        
+        # 그 다음 실제 평가
+        val_df = evaluate_and_save_edges(
+            model=model,
+            adjs=adjs,
+            edges_by_t=val_edges_by_t,
+            times_span=val_times,
+            dataset=dataset,
+            node_features=node_features,
+            device=device,
+            out_csv='chat2_evolvegcn_only_val_results.csv',
+            batch_name='VALIDATION'
+        )
+
+        # [수정] 원본 스타일 'TEST 단계 시작'
+        print("\n=== [추가] TEST 단계 시작 ===")
+
+        # Test
+        with torch.no_grad():
+            model.reset_sequence()
+            X_eval = node_features.to(device)
+            H_prev = model.x_proj(X_eval)
+            # (워밍업) Train + Val 시점을 모두 통과
+            for t in (train_times + val_times):
+                 # [BF16 오류 방지]
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=False):
+                    H_prev = model.step(H_prev.float(), adjs[t].float())
+        
+        test_df = evaluate_and_save_edges(
+            model=model,
+            adjs=adjs,
+            edges_by_t=test_edges_by_t,
+            times_span=test_times,
+            dataset=dataset,
+            node_features=node_features,
+            device=device,
+            out_csv='chat2_evolvegcn_only_test_results.csv',
+            batch_name='TEST'
+        )
+        
+        # [수정] 원본 스타일 'TEST 단계 완료'
+        print("\n=== TEST 단계 완료 ===")
+
+        # 7) Test 요약 지표 CSV
+        if test_df is not None and not test_df.empty:
+            y_true = test_df['actual_viral'].astype(int).to_numpy()
+            y_prob = test_df['prediction_probability'].astype(float).to_numpy()
+            y_pred = (y_prob > 0.5).astype(int)
+            acc  = accuracy_score(y_true, y_pred)
+            prec = precision_score(y_true, y_pred, zero_division=0)
+            rec  = recall_score(y_true, y_pred, zero_division=0)
+            f1   = f1_score(y_true, y_pred, zero_division=0)
+            auc  = roc_auc_score(y_true, y_prob) if np.unique(y_true).size > 1 else np.nan
+
+            # [수정] 원본 스타일 Test metrics 출력
+            print("\n=== Test metrics (t=0.5) ===")
+            print(f"Edges      : {len(y_true)}")
+            print(f"Accuracy   : {acc*100:.2f}%")
+            print(f"Precision  : {prec*100:.2f}%")
+            print(f"Recall     : {rec*100:.2f}%")
+            print(f"F1-score   : {f1*100:.2f}%")
+            print(f"AUC        : {auc:.4f}")
+
+            pd.DataFrame([{
+                "edges": len(y_true),
+                "accuracy": acc,
+                "precision": prec,
+                "recall": rec,
+                "f1": f1,
+                "auc": auc
+            }]).to_csv("chat2_evolvegcn_only_test_metrics.csv", index=False, encoding="utf-8-sig")
+            print("Saved: chat2_evolvegcn_only_test_metrics.csv")
+
+        print("\n=== 완료 ===")
+
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
